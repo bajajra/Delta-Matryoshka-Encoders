@@ -20,6 +20,10 @@ from .hf_export import (
     DeltaMatryoshkaConfig, DeltaMatryoshkaModel, DeltaMatryoshkaForMaskedLM,
     export_to_huggingface, export_all_budgets, load_sliced_model
 )
+from .data_utils import (
+    pretokenize_dataset, PackedMLMDataset, StreamingPackedDataset,
+    create_dataloader, SequencePacker
+)
 
 __all__ = [
     # Model
@@ -69,4 +73,11 @@ __all__ = [
     "export_to_huggingface",
     "export_all_budgets",
     "load_sliced_model",
+    
+    # Data Utilities
+    "pretokenize_dataset",
+    "PackedMLMDataset",
+    "StreamingPackedDataset",
+    "create_dataloader",
+    "SequencePacker",
 ]
