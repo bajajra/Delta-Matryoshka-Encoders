@@ -53,9 +53,13 @@ class Args:
     streaming: bool = True
     shuffle_buffer: int = 10000
     
+    # Pretokenized data (faster training)
+    pretokenized_path: Optional[str] = None  # Path to pretokenized .pt file
+    use_packing: bool = True  # Use sequence packing
+    
     # Tokenizer
     tokenizer: str = "thebajajra/RexBERT-base"
-    max_length: int = 128
+    max_length: int = 512  # Standard BERT/RexBERT sequence length
     
     # Training
     batch_size: int = 64
@@ -146,9 +150,17 @@ def parse_args():
     p.add_argument("--no_streaming", action="store_false", dest="streaming")
     p.add_argument("--shuffle_buffer", type=int, default=10000)
     
+    # Pretokenized data (faster training)
+    p.add_argument("--pretokenized_path", type=str, default=None,
+                   help="Path to pretokenized packed .pt file (use data_utils.py to create)")
+    p.add_argument("--use_packing", action="store_true", default=True,
+                   help="Use sequence packing for efficiency")
+    p.add_argument("--no_packing", action="store_false", dest="use_packing")
+    
     # Tokenizer
     p.add_argument("--tokenizer", type=str, default="thebajajra/RexBERT-base")
-    p.add_argument("--max_length", type=int, default=128)
+    p.add_argument("--max_length", type=int, default=512,
+                   help="Maximum sequence length (512 for BERT/RexBERT, up to 2048 for extended)")
     
     # Training
     p.add_argument("--batch_size", type=int, default=64)
@@ -388,20 +400,59 @@ def main():
     # Routing preview head (token-level)
     preview = ResidualPreview(args.hidden_size, args.residual_preview_hidden).to(device) if args.enable_token_delta else None
 
-    # Data
-    ds, collator = prepare_dataset(args, tokenizer)
-    
-    if args.streaming:
-        # For streaming datasets, we iterate directly
-        train_iter = iter(ds["train"])
-    else:
-        train_loader = DataLoader(ds["train"], batch_size=args.batch_size, shuffle=True, collate_fn=collator)
+    # Data - use pretokenized if available, otherwise standard loading
+    if args.pretokenized_path:
+        print(f"Using pretokenized data from: {args.pretokenized_path}")
+        from .data_utils import PackedMLMDataset, create_dataloader
+        
+        train_loader = create_dataloader(
+            data_path=args.pretokenized_path,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=4,
+            tokenizer_name=args.tokenizer,
+            mlm_probability=0.15,
+        )
         train_iter = None
-    
-    # Validation loader (if available)
-    eval_loader = None
-    if not args.streaming and "validation" in ds:
-        eval_loader = DataLoader(ds["validation"], batch_size=args.batch_size, shuffle=False, collate_fn=collator)
+        eval_loader = None  # TODO: support pretokenized validation
+        collator = None
+        
+        print(f"  Loaded {len(train_loader.dataset)} packed examples")
+        print(f"  Effective sequences (with packing): ~{len(train_loader.dataset) * 3}x")
+    elif args.use_packing and not args.streaming:
+        # Use on-the-fly packing for non-streaming
+        print("Using on-the-fly sequence packing...")
+        from .data_utils import StreamingPackedDataset
+        
+        train_dataset = StreamingPackedDataset(
+            dataset_name=args.dataset_name,
+            tokenizer_name=args.tokenizer,
+            max_length=args.max_length,
+            text_column=args.text_column,
+            mlm_probability=0.15,
+            shuffle_buffer=args.shuffle_buffer,
+            dataset_config=args.dataset_config,
+        )
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=2)
+        train_iter = None
+        eval_loader = None
+        collator = None
+    else:
+        # Standard data loading (original behavior)
+        ds, collator = prepare_dataset(args, tokenizer)
+        
+        if args.streaming:
+            # For streaming datasets, we iterate directly
+            train_iter = iter(ds["train"])
+            train_loader = None
+        else:
+            train_loader = DataLoader(ds["train"], batch_size=args.batch_size, shuffle=True, collate_fn=collator)
+            train_iter = None
+        
+        # Validation loader (if available)
+        eval_loader = None
+        if not args.streaming and "validation" in ds:
+            eval_loader = DataLoader(ds["validation"], batch_size=args.batch_size, shuffle=False, collate_fn=collator)
 
     # Optimizer
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

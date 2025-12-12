@@ -162,7 +162,11 @@ def pretokenize_dataset(
         dataset_name: HuggingFace dataset name
         output_dir: Directory to save pretokenized data
         tokenizer_name: Tokenizer to use
-        max_length: Maximum sequence length
+        max_length: Maximum sequence length. Common values:
+            - 128: Fast training, short texts
+            - 512: Standard BERT/RexBERT (recommended)
+            - 1024: Extended context (RexBERT-base supports this)
+            - 2048: Maximum extended context
         text_column: Column containing text
         num_proc: Number of processes for tokenization
         dataset_config: Dataset configuration name
@@ -172,6 +176,13 @@ def pretokenize_dataset(
     
     Returns:
         Path to saved dataset
+        
+    Example:
+        # Standard 512 length
+        pretokenize_dataset("thebajajra/Ecom-niverse", "./data", max_length=512)
+        
+        # Extended 1024 for longer product descriptions
+        pretokenize_dataset("thebajajra/Ecom-niverse", "./data", max_length=1024)
     """
     if not HF_AVAILABLE:
         raise ImportError("datasets and transformers required")
@@ -566,7 +577,7 @@ if __name__ == "__main__":
     parser.add_argument("--tokenizer", type=str, default="thebajajra/RexBERT-base",
                         help="Tokenizer name")
     parser.add_argument("--max_length", type=int, default=512,
-                        help="Maximum sequence length")
+                        help="Maximum sequence length (128=fast, 512=standard, 1024/2048=extended)")
     parser.add_argument("--text_column", type=str, default="text",
                         help="Text column name")
     parser.add_argument("--num_proc", type=int, default=4,

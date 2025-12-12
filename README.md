@@ -138,7 +138,7 @@ src/
 For faster training, pretokenize and pack your dataset:
 
 ```bash
-# Pretokenize and pack E-comniverse dataset
+# Pretokenize and pack E-comniverse dataset (512 = standard length)
 python -m src.data_utils \
     --dataset thebajajra/Ecom-niverse \
     --output ./data/ecomniverse_packed \
@@ -146,12 +146,29 @@ python -m src.data_utils \
     --max_length 512 \
     --num_proc 8
 
+# For longer e-commerce texts, use extended context (1024)
+python -m src.data_utils \
+    --dataset thebajajra/Ecom-niverse \
+    --output ./data/ecomniverse_packed_1024 \
+    --tokenizer thebajajra/RexBERT-base \
+    --max_length 1024 \
+    --num_proc 8
+
 # Then train with pretokenized data (much faster!)
 python -m src.train_mlm \
     --pretokenized_path ./data/ecomniverse_packed/train_packed.pt \
     --tokenizer thebajajra/RexBERT-base \
+    --max_length 512 \
     ...
 ```
+
+**Sequence length options:**
+| Length | Use Case | Speed |
+|--------|----------|-------|
+| 128 | Quick experiments, short texts | Fastest |
+| 512 | Standard BERT/RexBERT (recommended) | Fast |
+| 1024 | Long product descriptions | Medium |
+| 2048 | Maximum extended context | Slow |
 
 **Benefits of pretokenization + packing:**
 - **3-5x faster training** - no tokenization overhead
