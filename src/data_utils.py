@@ -161,7 +161,7 @@ def tokenize_dataset(
     tokenized = ds.map(
         tokenize_fn,
         batched=True,
-        remove_columns=[c for c in ds.column_names if c != text_column],
+        remove_columns=ds.column_names,
         num_proc=num_proc,
         desc="Tokenizing",
         batch_size=batch_size,
@@ -281,7 +281,9 @@ def pack_tokenized_dataset(
     sep_token_id: int = 102,
     cls_token_id: int = 101,
     pad_token_id: int = 0,
-) -> Dict[str, List]:
+    output_path: Optional[str] = None,
+    save_interval: int = 100000,
+) -> Dict[str, Any]:
     """
     Pack tokenized sequences into fixed-length examples.
     
@@ -292,10 +294,14 @@ def pack_tokenized_dataset(
         sep_token_id: SEP token ID (used if tokenizer not provided)
         cls_token_id: CLS token ID
         pad_token_id: PAD token ID
+        output_path: If provided, save directly to disk (memory efficient)
+        save_interval: Save progress every N packed examples
         
     Returns:
-        Dict with 'input_ids' and 'attention_mask' lists
+        Dict with 'input_ids' and 'attention_mask' as numpy arrays
     """
+    import numpy as np
+    
     if tokenizer:
         sep_token_id = tokenizer.sep_token_id or sep_token_id
         cls_token_id = tokenizer.cls_token_id or cls_token_id
@@ -312,6 +318,8 @@ def pack_tokenized_dataset(
     packed_attention_mask = []
     
     logger.info("Packing sequences...")
+    total_seqs = len(tokenized_dataset) if hasattr(tokenized_dataset, '__len__') else "unknown"
+    
     for i, example in enumerate(tokenized_dataset):
         input_ids = example["input_ids"]
         if not input_ids:
@@ -323,7 +331,7 @@ def pack_tokenized_dataset(
             packed_attention_mask.append(packed.attention_mask)
         
         if (i + 1) % 100000 == 0:
-            logger.info(f"  Processed {i+1} sequences, packed {len(packed_input_ids)} examples")
+            logger.info(f"  Processed {i+1}/{total_seqs} sequences, packed {len(packed_input_ids)} examples")
     
     # Flush remaining
     final = packer.flush()
@@ -331,13 +339,26 @@ def pack_tokenized_dataset(
         packed_input_ids.append(final.input_ids)
         packed_attention_mask.append(final.attention_mask)
     
-    total_seqs = len(tokenized_dataset)
-    logger.info(f"Packing complete: {total_seqs} sequences -> {len(packed_input_ids)} packed examples")
-    logger.info(f"Packing ratio: {total_seqs / max(1, len(packed_input_ids)):.2f}x efficiency gain")
+    num_packed = len(packed_input_ids)
+    if isinstance(total_seqs, int):
+        logger.info(f"Packing complete: {total_seqs} sequences -> {num_packed} packed examples")
+        logger.info(f"Packing ratio: {total_seqs / max(1, num_packed):.2f}x efficiency gain")
+    else:
+        logger.info(f"Packing complete: {num_packed} packed examples")
+    
+    # Convert to numpy arrays for MUCH faster saving
+    logger.info("Converting to numpy arrays for efficient saving...")
+    input_ids_np = np.array(packed_input_ids, dtype=np.int32)
+    attention_mask_np = np.array(packed_attention_mask, dtype=np.int8)
+    
+    logger.info(f"  input_ids shape: {input_ids_np.shape}, size: {input_ids_np.nbytes / 1e9:.2f} GB")
+    logger.info(f"  attention_mask shape: {attention_mask_np.shape}, size: {attention_mask_np.nbytes / 1e9:.2f} GB")
     
     return {
-        "input_ids": packed_input_ids,
-        "attention_mask": packed_attention_mask,
+        "input_ids": input_ids_np,
+        "attention_mask": attention_mask_np,
+        "max_length": max_length,
+        "num_examples": num_packed,
     }
 
 
@@ -456,8 +477,23 @@ def pretokenize_dataset(
         )
         
         packed_path = os.path.join(output_dir, f"{split}_packed.pt")
-        logger.info(f"Saving packed dataset to {packed_path}")
+        logger.info(f"Saving packed dataset to {packed_path}...")
+        
+        # Use numpy's save for large arrays (much faster than torch.save)
+        import numpy as np
+        np_path = os.path.join(output_dir, f"{split}_packed.npz")
+        logger.info(f"Saving as compressed numpy (.npz) for speed...")
+        np.savez_compressed(
+            np_path,
+            input_ids=packed["input_ids"],
+            attention_mask=packed["attention_mask"],
+        )
+        logger.info(f"Saved to {np_path}")
+        
+        # Also save as .pt for compatibility (but with numpy arrays, it's fast now)
+        logger.info(f"Also saving as .pt for PyTorch compatibility...")
         torch.save(packed, packed_path)
+        logger.info(f"Saved to {packed_path}")
     
     # Save tokenizer
     tokenizer_path = os.path.join(output_dir, "tokenizer")
@@ -506,11 +542,40 @@ class PackedMLMDataset(Dataset):
         tokenizer_path: Optional[str] = None,
         tokenizer_name: str = "thebajajra/RexBERT-base",
     ):
-        logger.info(f"Loading packed dataset from {data_path}")
-        data = torch.load(data_path)
+        import numpy as np
         
-        self.input_ids = data["input_ids"]
-        self.attention_mask = data["attention_mask"]
+        logger.info(f"Loading packed dataset from {data_path}")
+        
+        # Support both .pt and .npz formats
+        if data_path.endswith(".npz"):
+            data = np.load(data_path)
+            self.input_ids = data["input_ids"]
+            self.attention_mask = data["attention_mask"]
+        elif data_path.endswith(".pt"):
+            data = torch.load(data_path)
+            self.input_ids = data["input_ids"]
+            self.attention_mask = data["attention_mask"]
+            # Convert to numpy if they're lists (legacy format)
+            if isinstance(self.input_ids, list):
+                logger.info("Converting lists to numpy arrays...")
+                self.input_ids = np.array(self.input_ids, dtype=np.int32)
+                self.attention_mask = np.array(self.attention_mask, dtype=np.int8)
+        else:
+            # Try .npz first, then .pt
+            npz_path = data_path.replace(".pt", ".npz") if ".pt" in data_path else data_path + ".npz"
+            pt_path = data_path.replace(".npz", ".pt") if ".npz" in data_path else data_path + ".pt"
+            
+            if os.path.exists(npz_path):
+                data = np.load(npz_path)
+                self.input_ids = data["input_ids"]
+                self.attention_mask = data["attention_mask"]
+            elif os.path.exists(pt_path):
+                data = torch.load(pt_path)
+                self.input_ids = data["input_ids"]
+                self.attention_mask = data["attention_mask"]
+            else:
+                raise FileNotFoundError(f"Could not find {npz_path} or {pt_path}")
+        
         self.mlm_probability = mlm_probability
         
         # Load tokenizer
@@ -531,8 +596,9 @@ class PackedMLMDataset(Dataset):
         return len(self.input_ids)
     
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
-        input_ids = torch.tensor(self.input_ids[idx], dtype=torch.long)
-        attention_mask = torch.tensor(self.attention_mask[idx], dtype=torch.long)
+        # Handle numpy arrays efficiently
+        input_ids = torch.from_numpy(self.input_ids[idx].astype('int64')).long()
+        attention_mask = torch.from_numpy(self.attention_mask[idx].astype('int64')).long()
         labels = input_ids.clone()
         
         # Don't mask special tokens or padding
@@ -753,10 +819,12 @@ def create_dataloader(
     """
     Create DataLoader from pretokenized data.
     
-    Automatically detects whether data is packed (.pt) or tokenized (directory).
+    Automatically detects format:
+    - .pt or .npz: Packed data (fast)
+    - directory: Tokenized Arrow format
     """
-    if data_path.endswith(".pt"):
-        # Packed data
+    if data_path.endswith(".pt") or data_path.endswith(".npz"):
+        # Packed data (.pt or .npz)
         dataset = PackedMLMDataset(
             data_path=data_path,
             mlm_probability=mlm_probability,
@@ -764,7 +832,7 @@ def create_dataloader(
             tokenizer_name=tokenizer_name,
         )
     else:
-        # Tokenized data (Arrow format)
+        # Tokenized data (Arrow format directory)
         dataset = TokenizedMLMDataset(
             data_path=data_path,
             mlm_probability=mlm_probability,
