@@ -346,10 +346,46 @@ def pack_tokenized_dataset(
     else:
         logger.info(f"Packing complete: {num_packed} packed examples")
     
+    # Verify all sequences have same length and fix if needed
+    logger.info("Verifying sequence lengths...")
+    lengths = [len(seq) for seq in packed_input_ids]
+    unique_lengths = set(lengths)
+    
+    if len(unique_lengths) > 1:
+        logger.warning(f"Found {len(unique_lengths)} different sequence lengths: {unique_lengths}")
+        logger.info(f"Padding all sequences to max_length={max_length}...")
+        
+        # Pad any sequences that are shorter than max_length
+        for i in range(len(packed_input_ids)):
+            if len(packed_input_ids[i]) < max_length:
+                pad_len = max_length - len(packed_input_ids[i])
+                packed_input_ids[i] = list(packed_input_ids[i]) + [pad_token_id] * pad_len
+                packed_attention_mask[i] = list(packed_attention_mask[i]) + [0] * pad_len
+            elif len(packed_input_ids[i]) > max_length:
+                # Truncate if somehow longer
+                packed_input_ids[i] = packed_input_ids[i][:max_length]
+                packed_attention_mask[i] = packed_attention_mask[i][:max_length]
+    
     # Convert to numpy arrays for MUCH faster saving
     logger.info("Converting to numpy arrays for efficient saving...")
-    input_ids_np = np.array(packed_input_ids, dtype=np.int32)
-    attention_mask_np = np.array(packed_attention_mask, dtype=np.int8)
+    try:
+        input_ids_np = np.array(packed_input_ids, dtype=np.int32)
+        attention_mask_np = np.array(packed_attention_mask, dtype=np.int8)
+    except ValueError as e:
+        # Fallback: create array row by row
+        logger.warning(f"Direct numpy conversion failed: {e}")
+        logger.info("Using row-by-row conversion (slower but safer)...")
+        
+        input_ids_np = np.zeros((num_packed, max_length), dtype=np.int32)
+        attention_mask_np = np.zeros((num_packed, max_length), dtype=np.int8)
+        
+        for i, (ids, mask) in enumerate(zip(packed_input_ids, packed_attention_mask)):
+            seq_len = min(len(ids), max_length)
+            input_ids_np[i, :seq_len] = ids[:seq_len]
+            attention_mask_np[i, :seq_len] = mask[:seq_len]
+            
+            if (i + 1) % 1000000 == 0:
+                logger.info(f"  Converted {i+1}/{num_packed} examples")
     
     logger.info(f"  input_ids shape: {input_ids_np.shape}, size: {input_ids_np.nbytes / 1e9:.2f} GB")
     logger.info(f"  attention_mask shape: {attention_mask_np.shape}, size: {attention_mask_np.nbytes / 1e9:.2f} GB")
