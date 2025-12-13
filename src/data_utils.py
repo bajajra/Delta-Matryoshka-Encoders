@@ -24,6 +24,15 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset, IterableDataset, DataLoader
 
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    # Fallback tqdm that does nothing
+    def tqdm(iterable, **kwargs):
+        return iterable
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -191,6 +200,58 @@ class PackedExample:
     input_ids: List[int]
     attention_mask: List[int]
     sequence_boundaries: List[int]
+    document_ids: Optional[List[int]] = None  # Which document each token belongs to
+
+
+def create_block_diagonal_mask(document_ids: List[int], max_length: int) -> List[List[int]]:
+    """
+    Create a 2D block-diagonal attention mask from document IDs.
+    
+    This prevents cross-attention between different documents in packed sequences,
+    similar to ModernBERT's approach.
+    
+    Args:
+        document_ids: List of document IDs for each token position
+        max_length: Maximum sequence length
+        
+    Returns:
+        2D attention mask where mask[i][j] = 1 if tokens i and j can attend to each other
+    """
+    seq_len = len(document_ids)
+    mask = [[0] * max_length for _ in range(max_length)]
+    
+    for i in range(seq_len):
+        for j in range(seq_len):
+            # Tokens can attend to each other only if they're in the same document
+            if document_ids[i] == document_ids[j]:
+                mask[i][j] = 1
+    
+    return mask
+
+
+def create_document_ids_from_boundaries(boundaries: List[int], total_length: int) -> List[int]:
+    """
+    Convert sequence boundaries to document IDs.
+    
+    Example:
+        boundaries = [10, 25, 40]  # End positions of docs 0, 1, 2
+        total_length = 50  # With padding
+        Returns: [0,0,0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 2,2,2,2,2,2,2,2,2,2,2,2,2,2,2, -1,-1,-1,-1,-1,-1,-1,-1,-1,-1]
+                 ^--- doc 0 (10 tokens) ^--- doc 1 (15 tokens)        ^--- doc 2 (15 tokens)        ^--- padding (-1)
+    """
+    document_ids = []
+    prev_boundary = 0
+    
+    for doc_id, boundary in enumerate(boundaries):
+        # Add doc_id for tokens between prev_boundary and boundary
+        document_ids.extend([doc_id] * (boundary - prev_boundary))
+        prev_boundary = boundary
+    
+    # Add -1 for padding tokens (they shouldn't attend to anything)
+    if len(document_ids) < total_length:
+        document_ids.extend([-1] * (total_length - len(document_ids)))
+    
+    return document_ids[:total_length]
 
 
 class SequencePacker:
@@ -251,17 +312,25 @@ class SequencePacker:
             return None
         
         ids = self._buffer_ids
+        boundaries = self._buffer_boundaries.copy()
+        
         if self.add_special_tokens:
             ids = [self.cls_token_id] + ids
+            # Adjust boundaries for the added CLS token
+            boundaries = [b + 1 for b in boundaries]
         
         pad_len = self.max_length - len(ids)
         attention_mask = [1] * len(ids) + [0] * pad_len
         ids = ids + [self.pad_token_id] * pad_len
         
+        # Create document IDs for block-diagonal attention masking
+        document_ids = create_document_ids_from_boundaries(boundaries, self.max_length)
+        
         packed = PackedExample(
             input_ids=ids,
             attention_mask=attention_mask,
-            sequence_boundaries=self._buffer_boundaries.copy()
+            sequence_boundaries=boundaries,
+            document_ids=document_ids,
         )
         
         self._buffer_ids = []
@@ -283,9 +352,14 @@ def pack_tokenized_dataset(
     pad_token_id: int = 0,
     output_path: Optional[str] = None,
     save_interval: int = 100000,
+    num_proc: Optional[int] = None,  # Auto-detect CPU count
+    batch_size: int = 50000,  # Larger batches = better packing efficiency
 ) -> Dict[str, Any]:
     """
-    Pack tokenized sequences into fixed-length examples.
+    Pack tokenized sequences into fixed-length examples with parallel processing.
+    
+    Uses HuggingFace Datasets' .map() with num_proc for parallelization.
+    Large batch sizes are used for better packing efficiency.
     
     Args:
         tokenized_dataset: Dataset with input_ids column
@@ -296,103 +370,210 @@ def pack_tokenized_dataset(
         pad_token_id: PAD token ID
         output_path: If provided, save directly to disk (memory efficient)
         save_interval: Save progress every N packed examples
+        num_proc: Number of processes for parallel packing (default: auto-detect CPUs)
+        batch_size: Batch size for map operation (larger = better packing, more memory)
         
     Returns:
-        Dict with 'input_ids' and 'attention_mask' as numpy arrays
+        Dict with 'input_ids', 'attention_mask', 'document_ids' as numpy arrays
     """
     import numpy as np
+    from tqdm import tqdm
     
     if tokenizer:
         sep_token_id = tokenizer.sep_token_id or sep_token_id
         cls_token_id = tokenizer.cls_token_id or cls_token_id
         pad_token_id = tokenizer.pad_token_id or pad_token_id
     
-    packer = SequencePacker(
-        max_length=max_length,
-        sep_token_id=sep_token_id,
-        cls_token_id=cls_token_id,
-        pad_token_id=pad_token_id,
-    )
+    # Auto-detect num_proc if not specified
+    if num_proc is None:
+        num_proc = min(24, os.cpu_count() or 8)
+        logger.info(f"Auto-detected {num_proc} CPUs for parallel packing")
     
-    packed_input_ids = []
-    packed_attention_mask = []
-    
-    logger.info("Packing sequences...")
-    total_seqs = len(tokenized_dataset) if hasattr(tokenized_dataset, '__len__') else "unknown"
-    
-    for i, example in enumerate(tokenized_dataset):
-        input_ids = example["input_ids"]
-        if not input_ids:
-            continue
+    if num_proc > 1:
+        # Parallel batched packing using .map() with optimized flattening
+        logger.info(f"Packing sequences with {num_proc} processes (batch_size={batch_size})...")
         
-        packed = packer.add_sequence(input_ids)
-        if packed:
-            packed_input_ids.append(packed.input_ids)
-            packed_attention_mask.append(packed.attention_mask)
+        def pack_batch(batch, indices):
+            """Pack a batch of sequences using greedy bin-packing.
+            
+            Returns flattened results - each packed sequence as a separate row.
+            This avoids the expensive Python-level flattening step.
+            """
+            input_ids_list = batch["input_ids"]
+            
+            packer = SequencePacker(
+                max_length=max_length,
+                sep_token_id=sep_token_id,
+                cls_token_id=cls_token_id,
+                pad_token_id=pad_token_id,
+            )
+            
+            packed_ids = []
+            packed_masks = []
+            packed_doc_ids = []
+            
+            for input_ids in input_ids_list:
+                if not input_ids:
+                    continue
+                
+                packed = packer.add_sequence(input_ids)
+                if packed:
+                    packed_ids.append(packed.input_ids)
+                    packed_masks.append(packed.attention_mask)
+                    packed_doc_ids.append(packed.document_ids)
+            
+            # Flush remaining buffer
+            final = packer.flush()
+            if final:
+                packed_ids.append(final.input_ids)
+                packed_masks.append(final.attention_mask)
+                packed_doc_ids.append(final.document_ids)
+            
+            # Return as flattened structure - each packed example is a row
+            return {
+                "input_ids": packed_ids,
+                "attention_mask": packed_masks,
+                "document_ids": packed_doc_ids,
+            }
         
-        if (i + 1) % 100000 == 0:
-            logger.info(f"  Processed {i+1}/{total_seqs} sequences, packed {len(packed_input_ids)} examples")
+        # Apply packing in parallel batches
+        # Use large batch sizes for efficiency
+        effective_batch_size = max(batch_size, 50000)  # Process large batches for better packing
+        
+        packed_dataset = tokenized_dataset.map(
+            pack_batch,
+            batched=True,
+            batch_size=effective_batch_size,
+            num_proc=num_proc,
+            remove_columns=tokenized_dataset.column_names,
+            desc="Packing sequences",
+            with_indices=True,  # For debugging if needed
+            # Control memory
+            writer_batch_size=max(1000, effective_batch_size // 50),
+        )
+        
+        # Fast flattening using numpy - the dataset now has lists of packed sequences per row
+        # We need to flatten to have one packed sequence per row
+        logger.info("Flattening packed sequences (fast path)...")
+        
+        # Count total packed examples first
+        total_packed = sum(len(ex["input_ids"]) for ex in packed_dataset)
+        logger.info(f"Total packed examples: {total_packed}")
+        
+        # Pre-allocate arrays
+        packed_input_ids = np.zeros((total_packed, max_length), dtype=np.int32)
+        packed_attention_mask = np.zeros((total_packed, max_length), dtype=np.int8)
+        packed_document_ids = np.zeros((total_packed, max_length), dtype=np.int16)
+        
+        # Fill arrays - this is I/O bound so single-threaded is fine
+        current_idx = 0
+        for example in tqdm(packed_dataset, desc="Collecting", unit="batch"):
+            batch_ids = example["input_ids"]
+            batch_masks = example["attention_mask"]
+            batch_doc_ids = example["document_ids"]
+            
+            for ids, mask, doc_ids in zip(batch_ids, batch_masks, batch_doc_ids):
+                # Ensure correct length (pad if needed)
+                ids_len = len(ids)
+                if ids_len < max_length:
+                    packed_input_ids[current_idx, :ids_len] = ids
+                    packed_attention_mask[current_idx, :ids_len] = mask[:ids_len]
+                    packed_document_ids[current_idx, :len(doc_ids)] = doc_ids
+                    # Padding already zeros from initialization
+                else:
+                    packed_input_ids[current_idx] = ids[:max_length]
+                    packed_attention_mask[current_idx] = mask[:max_length]
+                    packed_document_ids[current_idx] = doc_ids[:max_length]
+                current_idx += 1
+        
+        # Trim to actual size (in case of over-estimation)
+        packed_input_ids = packed_input_ids[:current_idx]
+        packed_attention_mask = packed_attention_mask[:current_idx]
+        packed_document_ids = packed_document_ids[:current_idx]
+        
+        num_packed = current_idx
+        total_seqs = len(tokenized_dataset)
+        
+    else:
+        # Sequential packing (original implementation, memory efficient for small datasets)
+        logger.info("Packing sequences sequentially...")
+        
+        packer = SequencePacker(
+            max_length=max_length,
+            sep_token_id=sep_token_id,
+            cls_token_id=cls_token_id,
+            pad_token_id=pad_token_id,
+        )
+        
+        # Pre-allocate numpy arrays (estimate capacity)
+        total_seqs = len(tokenized_dataset) if hasattr(tokenized_dataset, '__len__') else None
+        if total_seqs:
+            estimated_packed = max(1000, total_seqs // 3)
+        else:
+            estimated_packed = 1000000
+        
+        chunk_size = min(100000, estimated_packed)
+        packed_input_ids = np.zeros((chunk_size, max_length), dtype=np.int32)
+        packed_attention_mask = np.zeros((chunk_size, max_length), dtype=np.int8)
+        packed_document_ids = np.zeros((chunk_size, max_length), dtype=np.int16)
+        current_idx = 0
+        
+        iterator = tqdm(tokenized_dataset, desc="Packing", total=total_seqs, unit="seq")
+        
+        for example in iterator:
+            input_ids = example["input_ids"]
+            if not input_ids:
+                continue
+            
+            packed = packer.add_sequence(input_ids)
+            if packed:
+                if current_idx >= len(packed_input_ids):
+                    new_chunk = np.zeros((chunk_size, max_length), dtype=np.int32)
+                    mask_chunk = np.zeros((chunk_size, max_length), dtype=np.int8)
+                    doc_chunk = np.zeros((chunk_size, max_length), dtype=np.int16)
+                    packed_input_ids = np.vstack([packed_input_ids, new_chunk])
+                    packed_attention_mask = np.vstack([packed_attention_mask, mask_chunk])
+                    packed_document_ids = np.vstack([packed_document_ids, doc_chunk])
+                
+                packed_input_ids[current_idx] = packed.input_ids
+                packed_attention_mask[current_idx] = packed.attention_mask
+                packed_document_ids[current_idx] = packed.document_ids
+                current_idx += 1
+        
+        final = packer.flush()
+        if final:
+            if current_idx >= len(packed_input_ids):
+                new_chunk = np.zeros((chunk_size, max_length), dtype=np.int32)
+                mask_chunk = np.zeros((chunk_size, max_length), dtype=np.int8)
+                doc_chunk = np.zeros((chunk_size, max_length), dtype=np.int16)
+                packed_input_ids = np.vstack([packed_input_ids, new_chunk])
+                packed_attention_mask = np.vstack([packed_attention_mask, mask_chunk])
+                packed_document_ids = np.vstack([packed_document_ids, doc_chunk])
+            
+            packed_input_ids[current_idx] = final.input_ids
+            packed_attention_mask[current_idx] = final.attention_mask
+            packed_document_ids[current_idx] = final.document_ids
+            current_idx += 1
+        
+        packed_input_ids = packed_input_ids[:current_idx]
+        packed_attention_mask = packed_attention_mask[:current_idx]
+        packed_document_ids = packed_document_ids[:current_idx]
+        num_packed = current_idx
     
-    # Flush remaining
-    final = packer.flush()
-    if final:
-        packed_input_ids.append(final.input_ids)
-        packed_attention_mask.append(final.attention_mask)
-    
-    num_packed = len(packed_input_ids)
+    # Log results
     if isinstance(total_seqs, int):
-        logger.info(f"Packing complete: {total_seqs} sequences -> {num_packed} packed examples")
+        logger.info(f"\nPacking complete: {total_seqs} sequences -> {num_packed} packed examples")
         logger.info(f"Packing ratio: {total_seqs / max(1, num_packed):.2f}x efficiency gain")
     else:
-        logger.info(f"Packing complete: {num_packed} packed examples")
+        logger.info(f"\nPacking complete: {num_packed} packed examples")
     
-    # Verify all sequences have same length and fix if needed
-    logger.info("Verifying sequence lengths...")
-    lengths = [len(seq) for seq in packed_input_ids]
-    unique_lengths = set(lengths)
-    
-    if len(unique_lengths) > 1:
-        logger.warning(f"Found {len(unique_lengths)} different sequence lengths: {unique_lengths}")
-        logger.info(f"Padding all sequences to max_length={max_length}...")
-        
-        # Pad any sequences that are shorter than max_length
-        for i in range(len(packed_input_ids)):
-            if len(packed_input_ids[i]) < max_length:
-                pad_len = max_length - len(packed_input_ids[i])
-                packed_input_ids[i] = list(packed_input_ids[i]) + [pad_token_id] * pad_len
-                packed_attention_mask[i] = list(packed_attention_mask[i]) + [0] * pad_len
-            elif len(packed_input_ids[i]) > max_length:
-                # Truncate if somehow longer
-                packed_input_ids[i] = packed_input_ids[i][:max_length]
-                packed_attention_mask[i] = packed_attention_mask[i][:max_length]
-    
-    # Convert to numpy arrays for MUCH faster saving
-    logger.info("Converting to numpy arrays for efficient saving...")
-    try:
-        input_ids_np = np.array(packed_input_ids, dtype=np.int32)
-        attention_mask_np = np.array(packed_attention_mask, dtype=np.int8)
-    except ValueError as e:
-        # Fallback: create array row by row
-        logger.warning(f"Direct numpy conversion failed: {e}")
-        logger.info("Using row-by-row conversion (slower but safer)...")
-        
-        input_ids_np = np.zeros((num_packed, max_length), dtype=np.int32)
-        attention_mask_np = np.zeros((num_packed, max_length), dtype=np.int8)
-        
-        for i, (ids, mask) in enumerate(zip(packed_input_ids, packed_attention_mask)):
-            seq_len = min(len(ids), max_length)
-            input_ids_np[i, :seq_len] = ids[:seq_len]
-            attention_mask_np[i, :seq_len] = mask[:seq_len]
-            
-            if (i + 1) % 1000000 == 0:
-                logger.info(f"  Converted {i+1}/{num_packed} examples")
-    
-    logger.info(f"  input_ids shape: {input_ids_np.shape}, size: {input_ids_np.nbytes / 1e9:.2f} GB")
-    logger.info(f"  attention_mask shape: {attention_mask_np.shape}, size: {attention_mask_np.nbytes / 1e9:.2f} GB")
+    logger.info(f"  input_ids shape: {packed_input_ids.shape}, size: {packed_input_ids.nbytes / 1e9:.2f} GB")
+    logger.info(f"  attention_mask shape: {packed_attention_mask.shape}, size: {packed_attention_mask.nbytes / 1e9:.2f} GB")
     
     return {
-        "input_ids": input_ids_np,
-        "attention_mask": attention_mask_np,
+        "input_ids": packed_input_ids,
+        "attention_mask": packed_attention_mask,
+        "document_ids": packed_document_ids,  # For block-diagonal attention masking
         "max_length": max_length,
         "num_examples": num_packed,
     }
@@ -417,6 +598,7 @@ def pretokenize_dataset(
     return_overflowing_tokens: bool = True,
     add_mask_token: bool = False,
     seed: int = 42,
+    pack_batch_size: int = 50000,  # Larger batches = better packing efficiency
 ):
     """
     Pretokenize and optionally pack a dataset with multi-CPU parallelization.
@@ -438,6 +620,7 @@ def pretokenize_dataset(
         return_overflowing_tokens: Split long texts into windows
         add_mask_token: Add <mask> token if missing
         seed: Random seed
+        pack_batch_size: Batch size for parallel packing (controls memory)
         
     Returns:
         Path to output directory
@@ -510,26 +693,30 @@ def pretokenize_dataset(
             tokenized_dataset=tokenized,
             max_length=max_length,
             tokenizer=tokenizer,
+            num_proc=num_proc,
+            batch_size=pack_batch_size,
         )
         
-        packed_path = os.path.join(output_dir, f"{split}_packed.pt")
-        logger.info(f"Saving packed dataset to {packed_path}...")
-        
-        # Use numpy's save for large arrays (much faster than torch.save)
         import numpy as np
+        
+        # Save as .npz (fast, compressed)
         np_path = os.path.join(output_dir, f"{split}_packed.npz")
-        logger.info(f"Saving as compressed numpy (.npz) for speed...")
+        logger.info(f"Saving as compressed numpy to {np_path}...")
         np.savez_compressed(
             np_path,
             input_ids=packed["input_ids"],
             attention_mask=packed["attention_mask"],
+            document_ids=packed["document_ids"],  # For block-diagonal attention masking
+            max_length=packed["max_length"],
+            num_examples=packed["num_examples"],
         )
-        logger.info(f"Saved to {np_path}")
+        logger.info(f"Saved to {np_path} ({os.path.getsize(np_path) / 1e9:.2f} GB)")
         
-        # Also save as .pt for compatibility (but with numpy arrays, it's fast now)
-        logger.info(f"Also saving as .pt for PyTorch compatibility...")
+        # Optionally save as .pt for PyTorch (faster with numpy arrays)
+        packed_path = os.path.join(output_dir, f"{split}_packed.pt")
+        logger.info(f"Also saving as .pt (PyTorch format)...")
         torch.save(packed, packed_path)
-        logger.info(f"Saved to {packed_path}")
+        logger.info(f"Saved to {packed_path} ({os.path.getsize(packed_path) / 1e9:.2f} GB)")
     
     # Save tokenizer
     tokenizer_path = os.path.join(output_dir, "tokenizer")
@@ -569,7 +756,12 @@ def pretokenize_dataset(
 # ============== PyTorch Datasets ==============
 
 class PackedMLMDataset(Dataset):
-    """PyTorch Dataset for pretokenized and packed MLM data."""
+    """
+    PyTorch Dataset for pretokenized and packed MLM data.
+    
+    Supports block-diagonal attention masking (like ModernBERT) to prevent
+    cross-attention between different documents packed into the same sequence.
+    """
     
     def __init__(
         self,
@@ -577,20 +769,28 @@ class PackedMLMDataset(Dataset):
         mlm_probability: float = 0.15,
         tokenizer_path: Optional[str] = None,
         tokenizer_name: str = "thebajajra/RexBERT-base",
+        use_block_diagonal_attention: bool = True,  # Enable document-aware masking
     ):
         import numpy as np
         
         logger.info(f"Loading packed dataset from {data_path}")
+        
+        self.document_ids = None
+        self.use_block_diagonal_attention = use_block_diagonal_attention
         
         # Support both .pt and .npz formats
         if data_path.endswith(".npz"):
             data = np.load(data_path)
             self.input_ids = data["input_ids"]
             self.attention_mask = data["attention_mask"]
+            if "document_ids" in data:
+                self.document_ids = data["document_ids"]
         elif data_path.endswith(".pt"):
             data = torch.load(data_path)
             self.input_ids = data["input_ids"]
             self.attention_mask = data["attention_mask"]
+            if "document_ids" in data:
+                self.document_ids = data["document_ids"]
             # Convert to numpy if they're lists (legacy format)
             if isinstance(self.input_ids, list):
                 logger.info("Converting lists to numpy arrays...")
@@ -605,10 +805,14 @@ class PackedMLMDataset(Dataset):
                 data = np.load(npz_path)
                 self.input_ids = data["input_ids"]
                 self.attention_mask = data["attention_mask"]
+                if "document_ids" in data:
+                    self.document_ids = data["document_ids"]
             elif os.path.exists(pt_path):
                 data = torch.load(pt_path)
                 self.input_ids = data["input_ids"]
                 self.attention_mask = data["attention_mask"]
+                if "document_ids" in data:
+                    self.document_ids = data["document_ids"]
             else:
                 raise FileNotFoundError(f"Could not find {npz_path} or {pt_path}")
         
@@ -626,7 +830,10 @@ class PackedMLMDataset(Dataset):
         self.sep_token_id = self.tokenizer.sep_token_id or 102
         self.vocab_size = self.tokenizer.vocab_size
         
-        logger.info(f"Loaded {len(self.input_ids)} packed examples")
+        if self.document_ids is not None:
+            logger.info(f"Loaded {len(self.input_ids)} packed examples with document IDs (block-diagonal attention enabled)")
+        else:
+            logger.info(f"Loaded {len(self.input_ids)} packed examples (no document IDs - cross-attention allowed)")
     
     def __len__(self):
         return len(self.input_ids)
@@ -658,11 +865,17 @@ class PackedMLMDataset(Dataset):
         random_words = torch.randint(self.vocab_size, labels.shape, dtype=torch.long)
         input_ids[indices_random] = random_words[indices_random]
         
-        return {
+        result = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
         }
+        
+        # Add document_ids for block-diagonal attention masking (like ModernBERT)
+        if self.use_block_diagonal_attention and self.document_ids is not None:
+            result["document_ids"] = torch.from_numpy(self.document_ids[idx].astype('int64')).long()
+        
+        return result
 
 
 class TokenizedMLMDataset(Dataset):
@@ -743,7 +956,7 @@ class TokenizedMLMDataset(Dataset):
 
 
 class StreamingPackedDataset(IterableDataset):
-    """Streaming dataset that packs sequences on-the-fly."""
+    """Streaming dataset that packs sequences on-the-fly with stride for long texts."""
     
     def __init__(
         self,
@@ -754,6 +967,8 @@ class StreamingPackedDataset(IterableDataset):
         mlm_probability: float = 0.15,
         shuffle_buffer: int = 10000,
         dataset_config: Optional[str] = None,
+        stride: int = 64,  # Overlap between windows for long texts
+        return_overflowing_tokens: bool = True,  # Split long texts into windows
     ):
         self.dataset_name = dataset_name
         self.dataset_config = dataset_config
@@ -761,6 +976,8 @@ class StreamingPackedDataset(IterableDataset):
         self.max_length = max_length
         self.mlm_probability = mlm_probability
         self.shuffle_buffer = shuffle_buffer
+        self.stride = stride
+        self.return_overflowing_tokens = return_overflowing_tokens
         
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         self.mask_token_id = self.tokenizer.mask_token_id or 103
@@ -790,21 +1007,44 @@ class StreamingPackedDataset(IterableDataset):
             if not text or not text.strip():
                 continue
             
+            # Tokenize with overflowing tokens for long texts
             tokens = self.tokenizer(
                 text,
                 padding=False,
                 truncation=True,
-                max_length=self.max_length - 2,
+                max_length=self.max_length - 2,  # Leave room for CLS/SEP
                 add_special_tokens=False,
+                return_overflowing_tokens=self.return_overflowing_tokens,
+                stride=self.stride if self.return_overflowing_tokens else 0,
             )
             
-            input_ids = tokens["input_ids"]
-            if not input_ids:
-                continue
-            
-            packed = packer.add_sequence(input_ids)
-            if packed:
-                yield self._apply_mlm(packed)
+            # Handle both single sequence and multiple windows
+            if self.return_overflowing_tokens and "overflow_to_sample_mapping" in tokens:
+                # Multiple windows from long text
+                all_input_ids = tokens["input_ids"]
+                if isinstance(all_input_ids[0], list):
+                    # Batched output - multiple windows
+                    for input_ids in all_input_ids:
+                        if not input_ids:
+                            continue
+                        packed = packer.add_sequence(input_ids)
+                        if packed:
+                            yield self._apply_mlm(packed)
+                else:
+                    # Single sequence
+                    if all_input_ids:
+                        packed = packer.add_sequence(all_input_ids)
+                        if packed:
+                            yield self._apply_mlm(packed)
+            else:
+                # Standard tokenization (no overflow)
+                input_ids = tokens["input_ids"]
+                if not input_ids:
+                    continue
+                
+                packed = packer.add_sequence(input_ids)
+                if packed:
+                    yield self._apply_mlm(packed)
         
         final = packer.flush()
         if final:
@@ -833,11 +1073,17 @@ class StreamingPackedDataset(IterableDataset):
         random_words = torch.randint(self.vocab_size, labels.shape, dtype=torch.long)
         input_ids[indices_random] = random_words[indices_random]
         
-        return {
+        result = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
         }
+        
+        # Add document_ids for block-diagonal attention masking (like ModernBERT)
+        if packed.document_ids is not None:
+            result["document_ids"] = torch.tensor(packed.document_ids, dtype=torch.long)
+        
+        return result
 
 
 # ============== DataLoader Factory ==============
@@ -930,7 +1176,9 @@ if __name__ == "__main__":
     
     # Processing
     parser.add_argument("--num-proc", type=int, default=min(32, os.cpu_count() or 8),
-                        help="Number of CPU processes for parallel tokenization")
+                        help="Number of CPU processes for parallel tokenization and packing")
+    parser.add_argument("--pack-batch-size", type=int, default=50000,
+                        help="Batch size for parallel packing (larger = better packing efficiency)")
     
     # Tokenization
     parser.add_argument("--max-length", type=int, default=512,
@@ -965,4 +1213,5 @@ if __name__ == "__main__":
         return_overflowing_tokens=args.return_overflowing_tokens,
         add_mask_token=args.add_mask_token,
         seed=args.seed,
+        pack_batch_size=args.pack_batch_size,
     )
