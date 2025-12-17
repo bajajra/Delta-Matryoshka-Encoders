@@ -21,8 +21,8 @@ from .hf_export import (
     export_to_huggingface, export_all_budgets, load_sliced_model
 )
 from .data_utils import (
-    pretokenize_dataset, PackedMLMDataset, StreamingPackedDataset,
-    create_dataloader, SequencePacker
+    pretokenize_dataset, TokenizedMLMDataset, 
+    create_dataloader, load_tokenized_dataset
 )
 
 __all__ = [
@@ -74,10 +74,9 @@ __all__ = [
     "export_all_budgets",
     "load_sliced_model",
     
-    # Data Utilities
+    # Data Utilities (tokenization only - packing at training time)
     "pretokenize_dataset",
-    "PackedMLMDataset",
-    "StreamingPackedDataset",
+    "TokenizedMLMDataset",
     "create_dataloader",
-    "SequencePacker",
+    "load_tokenized_dataset",
 ]
