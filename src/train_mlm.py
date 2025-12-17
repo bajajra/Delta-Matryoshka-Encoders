@@ -4,6 +4,7 @@ Delta-Matryoshka++ MLM Training Script
 Features:
 - Three-phase training (Packing -> Residualization -> Calibration)
 - E-comniverse dataset support with streaming
+- Training-time sequence packing (like ModernBERT/rexgemma)
 - DDS regularization
 - CSCF loss for feature alignment
 - Budget controller penalty
@@ -19,12 +20,13 @@ import json
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict, Any
 
+import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, IterableDataset
 
 from transformers import AutoTokenizer, DataCollatorForLanguageModeling
-from datasets import load_dataset
+from datasets import load_dataset, Dataset, DatasetDict, load_from_disk, concatenate_datasets
 
 from .model import build_model, Budget, DeltaEncoder
 from .losses import (
@@ -36,6 +38,104 @@ from .scheduler import (
     PhaseScheduler, PhaseSchedulerConfig, WarmupCosineScheduler, BudgetSampler
 )
 from .droppath import SurvivalSchedule, PrefixDepthDropout
+
+
+# ------------------------- Packing utilities (training-time) -------------------------
+
+def _as_dataset(dataset_or_dict) -> Dataset:
+    """Make sure we return a single Dataset (concatenate splits if needed)."""
+    if isinstance(dataset_or_dict, Dataset):
+        return dataset_or_dict
+    if isinstance(dataset_or_dict, DatasetDict):
+        if "train" in dataset_or_dict:
+            return dataset_or_dict["train"]
+        # Concatenate all splits if no explicit train split
+        return concatenate_datasets(list(dataset_or_dict.values()))
+    raise ValueError("Unsupported dataset object loaded from disk.")
+
+
+def make_packed_dataset(
+    dataset_path: str,
+    tokenizer,
+    pack_len: int,
+    out_cap: Optional[int] = None,
+    num_proc: int = 8,
+) -> Dataset:
+    """
+    Build a packed Dataset (fixed-length blocks) from an on-disk pretokenized dataset.
+    
+    This is the ModernBERT/rexgemma approach: packing happens at training time,
+    not during preprocessing.
+    
+    Args:
+        dataset_path: Path to pretokenized dataset (Arrow format from save_to_disk)
+        tokenizer: Tokenizer for getting separator token ID
+        pack_len: Target packed sequence length
+        out_cap: Optional cap on number of packed examples
+        num_proc: Number of processes for parallel packing
+        
+    Returns:
+        Packed Dataset with fixed-length sequences
+    """
+    base = _as_dataset(load_from_disk(dataset_path))
+    
+    # Use SEP or EOS as separator between documents
+    sep_id = tokenizer.sep_token_id or tokenizer.eos_token_id
+    
+    def pack_batch(batch: Dict[str, List]) -> Dict[str, List]:
+        """Pack a batch of variable-length sequences into fixed-length blocks."""
+        # 1) Concatenate trimmed examples with separator tokens
+        all_tokens = []
+        for ids, mask in zip(batch["input_ids"], batch["attention_mask"]):
+            L = int(np.sum(mask)) if isinstance(mask, (list, np.ndarray)) else len(ids)
+            if L > 0:
+                all_tokens.extend(ids[:L])
+                if sep_id is not None:
+                    all_tokens.append(sep_id)
+        
+        # 2) Chunk into fixed-length blocks (drop incomplete tail for tight packing)
+        packed_ids = []
+        for i in range(0, len(all_tokens), pack_len):
+            chunk = all_tokens[i : i + pack_len]
+            if len(chunk) == pack_len:
+                packed_ids.append(chunk)
+        
+        if not packed_ids:
+            return {"input_ids": [], "attention_mask": []}
+        
+        # 3) All ones attention mask (no intra-batch padding)
+        return {
+            "input_ids": packed_ids,
+            "attention_mask": [[1] * pack_len for _ in packed_ids],
+        }
+    
+    print(f"[INFO] Packing dataset to fixed length = {pack_len}")
+    packed = base.map(
+        pack_batch,
+        batched=True,
+        batch_size=1000,  # Process in batches for efficiency
+        num_proc=max(1, num_proc),
+        remove_columns=base.column_names,
+        desc=f"Packing -> {pack_len}",
+    )
+    
+    if out_cap and out_cap > 0:
+        packed = packed.select(range(min(out_cap, len(packed))))
+    
+    # Add constant length column (for potential group_by_length)
+    packed = packed.map(
+        lambda batch: {"length": [pack_len] * len(batch["input_ids"])},
+        batched=True,
+        desc="Adding length column",
+        num_proc=num_proc,
+        batch_size=1000,
+    )
+    
+    # Set format for PyTorch
+    packed = packed.with_format(type="torch", columns=["input_ids", "attention_mask", "length"])
+    
+    print(f"[INFO] Created {len(packed)} packed examples of length {pack_len}")
+    return packed
 
 
 def seed_everything(seed: int = 42):
@@ -53,9 +153,13 @@ class Args:
     streaming: bool = True
     shuffle_buffer: int = 10000
     
-    # Pretokenized data (faster training)
-    pretokenized_path: Optional[str] = None  # Path to pretokenized .pt file
-    use_packing: bool = True  # Use sequence packing
+    # Pretokenized data (faster training) - tokenized Arrow format from data_utils.py
+    pretokenized_path: Optional[str] = None  # Path to pretokenized Arrow dataset
+    
+    # Training-time packing (like ModernBERT/rexgemma)
+    pack_seq_len: int = 512  # Packed block length (tokens)
+    pack_cap: int = 0  # Cap the #packed blocks for quick runs (0 = no cap)
+    pack_workers: int = 8  # Packing map num_proc
     
     # Tokenizer
     tokenizer: str = "thebajajra/RexBERT-base"
@@ -150,12 +254,17 @@ def parse_args():
     p.add_argument("--no_streaming", action="store_false", dest="streaming")
     p.add_argument("--shuffle_buffer", type=int, default=10000)
     
-    # Pretokenized data (faster training)
+    # Pretokenized data (faster training) - tokenized Arrow format from data_utils.py
     p.add_argument("--pretokenized_path", type=str, default=None,
-                   help="Path to pretokenized packed .pt file (use data_utils.py to create)")
-    p.add_argument("--use_packing", action="store_true", default=True,
-                   help="Use sequence packing for efficiency")
-    p.add_argument("--no_packing", action="store_false", dest="use_packing")
+                   help="Path to pretokenized Arrow dataset (from data_utils.py)")
+    
+    # Training-time packing (like ModernBERT/rexgemma)
+    p.add_argument("--pack_seq_len", type=int, default=512,
+                   help="Packed block length in tokens (packing happens at training time)")
+    p.add_argument("--pack_cap", type=int, default=0,
+                   help="Cap the number of packed blocks for quick runs (0 = no cap)")
+    p.add_argument("--pack_workers", type=int, default=max(4, (os.cpu_count() or 8) // 2),
+                   help="Number of workers for parallel packing")
     
     # Tokenizer
     p.add_argument("--tokenizer", type=str, default="thebajajra/RexBERT-base")
@@ -400,45 +509,46 @@ def main():
     # Routing preview head (token-level)
     preview = ResidualPreview(args.hidden_size, args.residual_preview_hidden).to(device) if args.enable_token_delta else None
 
-    # Data - use pretokenized if available, otherwise standard loading
+    # Data loading - pack at training time (like ModernBERT/rexgemma)
     if args.pretokenized_path:
-        print(f"Using pretokenized data from: {args.pretokenized_path}")
-        from .data_utils import PackedMLMDataset, create_dataloader
+        # Load pretokenized data and pack at training time
+        print(f"Loading pretokenized data from: {args.pretokenized_path}")
+        print(f"Packing to fixed length = {args.pack_seq_len}")
         
-        train_loader = create_dataloader(
-            data_path=args.pretokenized_path,
+        packed = make_packed_dataset(
+            dataset_path=args.pretokenized_path,
+            tokenizer=tokenizer,
+            pack_len=args.pack_seq_len,
+            out_cap=(args.pack_cap if args.pack_cap > 0 else None),
+            num_proc=args.pack_workers,
+        )
+        
+        # MLM collator for dynamic masking
+        collator = DataCollatorForLanguageModeling(
+            tokenizer=tokenizer,
+            mlm=True,
+            mlm_probability=0.15,
+            pad_to_multiple_of=None,  # Already packed to fixed length
+        )
+        
+        train_loader = DataLoader(
+            packed,
             batch_size=args.batch_size,
             shuffle=True,
+            collate_fn=collator,
             num_workers=4,
-            tokenizer_name=args.tokenizer,
-            mlm_probability=0.15,
+            pin_memory=True,
+            drop_last=True,  # Avoid tiny last batch
         )
-        train_iter = None
-        eval_loader = None  # TODO: support pretokenized validation
-        collator = None
-        
-        print(f"  Loaded {len(train_loader.dataset)} packed examples")
-        print(f"  Effective sequences (with packing): ~{len(train_loader.dataset) * 3}x")
-    elif args.use_packing and not args.streaming:
-        # Use on-the-fly packing for non-streaming
-        print("Using on-the-fly sequence packing...")
-        from .data_utils import StreamingPackedDataset
-        
-        train_dataset = StreamingPackedDataset(
-            dataset_name=args.dataset_name,
-            tokenizer_name=args.tokenizer,
-            max_length=args.max_length,
-            text_column=args.text_column,
-            mlm_probability=0.15,
-            shuffle_buffer=args.shuffle_buffer,
-            dataset_config=args.dataset_config,
-        )
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=2)
         train_iter = None
         eval_loader = None
-        collator = None
+        
+        # Throughput info
+        eff_tokens_per_step = args.batch_size * args.pack_seq_len * max(1, args.grad_accum)
+        print(f"  Packed examples: {len(packed)}")
+        print(f"  Effective tokens per optimizer step: ~{eff_tokens_per_step:,}")
     else:
-        # Standard data loading (original behavior)
+        # Standard data loading (streaming or from HF hub)
         ds, collator = prepare_dataset(args, tokenizer)
         
         if args.streaming:
