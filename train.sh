@@ -1,0 +1,21 @@
+python -m src.train_mlm \
+  --pretokenized_path ./data/ecom-tokenized \
+  --pack_seq_len 2048 \
+  --pack_workers 64 \
+  --tokenizer thebajajra/RexBERT-base \
+  --output_dir ./ckpts/delta_matryoshka \
+  --batch_size 64 \
+  --grad_accum 4 \
+  --lr 2e-4 \
+  --weight_decay 0.01 \
+  --warmup_steps 1000 \
+  --train_steps 100000 \
+  --log_steps 50 \
+  --save_steps 5000 \
+  --fp16 \
+  --base_model_path thebajajra/RexBERT-mini \
+  --target_model_path thebajajra/RexBERT-base \
+  --enable_kd \
+  --enable_three_phase \
+  --enable_dds \
+  --seed 42
