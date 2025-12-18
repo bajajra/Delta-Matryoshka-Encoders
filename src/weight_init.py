@@ -711,6 +711,156 @@ def load_rexbert_to_delta(
     )
 
 
+def init_from_scratch(
+    delta_model: nn.Module,
+    architecture: str = "mini",
+    init_std: float = 0.02,
+    verbose: bool = True
+) -> nn.Module:
+    """
+    Initialize DeltaEncoder with random weights (no pretrained loading).
+    
+    Uses the specified architecture's dimensions but initializes all weights
+    from scratch using standard initialization schemes.
+    
+    Args:
+        delta_model: DeltaEncoder to initialize
+        architecture: Architecture name ("mini", "base", "large") or path
+        init_std: Standard deviation for weight initialization
+        verbose: Print progress
+        
+    Returns:
+        Randomly initialized DeltaEncoder
+    """
+    cfg = get_rexbert_config(architecture) if architecture else None
+    
+    if verbose:
+        print(f"Random Initialization from Scratch")
+        if cfg:
+            print(f"  Architecture: {cfg.name}")
+            print(f"    hidden={cfg.hidden_size}, layers={cfg.num_layers}, heads={cfg.num_heads}")
+        print(f"  Init std: {init_std}")
+    
+    with torch.no_grad():
+        # Initialize embeddings
+        _init_embeddings_from_scratch(delta_model, init_std, verbose)
+        
+        # Initialize transformer layers
+        _init_layers_from_scratch(delta_model, init_std, verbose)
+        
+        # Initialize LM head
+        _init_lm_head_from_scratch(delta_model, init_std, verbose)
+        
+        # Tie weights if applicable
+        if hasattr(delta_model, 'tie_weights'):
+            delta_model.tie_weights()
+    
+    if verbose:
+        total_params = sum(p.numel() for p in delta_model.parameters())
+        print(f"\n  Random initialization complete!")
+        print(f"  Total parameters: {total_params:,}")
+    
+    return delta_model
+
+
+def _init_embeddings_from_scratch(
+    delta_model: nn.Module,
+    init_std: float,
+    verbose: bool
+):
+    """Initialize embeddings with random weights."""
+    if verbose:
+        print("  Initializing embeddings from scratch...")
+    
+    emb = delta_model.embeddings
+    
+    # Word embeddings - normal distribution
+    nn.init.normal_(emb.word_embeddings.weight, mean=0.0, std=init_std)
+    
+    # Position embeddings - normal distribution
+    nn.init.normal_(emb.position_embeddings.weight, mean=0.0, std=init_std)
+    
+    # Token type embeddings (if exists)
+    if hasattr(emb, 'token_type_embeddings'):
+        nn.init.normal_(emb.token_type_embeddings.weight, mean=0.0, std=init_std)
+    
+    # LayerNorm - standard init (weight=1, bias=0)
+    if hasattr(emb, 'ln'):
+        nn.init.ones_(emb.ln.weight)
+        nn.init.zeros_(emb.ln.bias)
+    if hasattr(emb, 'LayerNorm'):
+        nn.init.ones_(emb.LayerNorm.weight)
+        nn.init.zeros_(emb.LayerNorm.bias)
+
+
+def _init_layers_from_scratch(
+    delta_model: nn.Module,
+    init_std: float,
+    verbose: bool
+):
+    """Initialize transformer layers with random weights."""
+    if verbose:
+        print("  Initializing transformer layers from scratch...")
+    
+    for layer_idx, layer in enumerate(delta_model.layers):
+        # Attention Q, K, V, O
+        attn = layer.attn
+        for proj in [attn.q, attn.k, attn.v, attn.o]:
+            if hasattr(proj, 'weight'):
+                nn.init.xavier_uniform_(proj.weight, gain=1.0)
+            if hasattr(proj, 'bias') and proj.bias is not None:
+                nn.init.zeros_(proj.bias)
+        
+        # MLP fc1, fc2
+        mlp = layer.mlp
+        if hasattr(mlp, 'fc1'):
+            nn.init.xavier_uniform_(mlp.fc1.weight, gain=1.0)
+            if mlp.fc1.bias is not None:
+                nn.init.zeros_(mlp.fc1.bias)
+        if hasattr(mlp, 'fc2'):
+            # Output projection - slightly smaller init for residual
+            nn.init.xavier_uniform_(mlp.fc2.weight, gain=init_std)
+            if mlp.fc2.bias is not None:
+                nn.init.zeros_(mlp.fc2.bias)
+        
+        # LayerNorms
+        for ln_name in ['ln1', 'ln2']:
+            ln = getattr(layer, ln_name, None)
+            if ln is not None:
+                if hasattr(ln, 'base_ln'):
+                    nn.init.ones_(ln.base_ln.weight)
+                    nn.init.zeros_(ln.base_ln.bias)
+                elif hasattr(ln, 'weight'):
+                    nn.init.ones_(ln.weight)
+                    nn.init.zeros_(ln.bias)
+
+
+def _init_lm_head_from_scratch(
+    delta_model: nn.Module,
+    init_std: float,
+    verbose: bool
+):
+    """Initialize LM head with random weights."""
+    if verbose:
+        print("  Initializing LM head from scratch...")
+    
+    # LM head prediction layer
+    if hasattr(delta_model, 'lm_head'):
+        head = delta_model.lm_head
+        if hasattr(head, 'dense'):
+            nn.init.xavier_uniform_(head.dense.weight, gain=1.0)
+            if head.dense.bias is not None:
+                nn.init.zeros_(head.dense.bias)
+        if hasattr(head, 'layer_norm'):
+            nn.init.ones_(head.layer_norm.weight)
+            nn.init.zeros_(head.layer_norm.bias)
+        if hasattr(head, 'decoder') and not head.decoder.weight.data_ptr() == delta_model.embeddings.word_embeddings.weight.data_ptr():
+            # Only init if not tied
+            nn.init.normal_(head.decoder.weight, mean=0.0, std=init_std)
+            if head.decoder.bias is not None:
+                nn.init.zeros_(head.decoder.bias)
+
+
 def verify_hierarchical_loading(
     delta_model: nn.Module,
     base_path: str,

@@ -344,6 +344,10 @@ def parse_args():
                    help="Initialize delta slices from target model weights")
     p.add_argument("--no_pretrained_init", action="store_true",
                    help="Skip pretrained weight initialization (random init)")
+    p.add_argument("--train_from_scratch", action="store_true",
+                   help="Initialize model with random weights (no pretrained loading)")
+    p.add_argument("--gradient_checkpointing", action="store_true",
+                   help="Enable gradient checkpointing for memory-efficient training")
     
     # Legacy (backward compat)
     p.add_argument("--init_from_rexbert", type=str, default=None,
@@ -446,7 +450,8 @@ def main():
     print(f"Config saved to {config_path}")
 
     tokenizer = build_tokenizer(args.tokenizer, args.max_length)
-    vocab_size = tokenizer.vocab_size if tokenizer.vocab_size is not None else args.vocab_size
+    # Use len(tokenizer) to account for any added special tokens
+    vocab_size = len(tokenizer) if len(tokenizer) > 0 else args.vocab_size
 
     # Build model
     model_cfg = dict(
@@ -473,12 +478,21 @@ def main():
     
     model = build_model(model_cfg)
     
-    # Initialize from pretrained weights (hierarchical)
-    if not args.export_only and not args.load_path and not getattr(args, 'no_pretrained_init', False):
-        from .weight_init import init_hierarchical_delta, load_rexbert_to_delta
+    # Initialize weights
+    if not args.export_only and not args.load_path:
+        from .weight_init import init_hierarchical_delta, load_rexbert_to_delta, init_from_scratch
         
-        # Legacy path
-        if args.init_from_rexbert:
+        # Option 1: Train from scratch (random init)
+        if getattr(args, 'train_from_scratch', False) or getattr(args, 'no_pretrained_init', False):
+            print("Initializing model from scratch (random weights)...")
+            model = init_from_scratch(
+                delta_model=model,
+                architecture=args.base_model_path or "mini",
+                init_std=0.02,
+                verbose=True
+            )
+        # Option 2: Legacy single-model loading
+        elif args.init_from_rexbert:
             print(f"[Legacy] Initializing from: {args.init_from_rexbert}")
             model = load_rexbert_to_delta(
                 model, 
@@ -486,7 +500,7 @@ def main():
                 base_ratio=args.base_ratio,
                 base_heads=args.base_heads
             )
-        # Hierarchical path (preferred)
+        # Option 3: Hierarchical initialization (default)
         elif args.base_model_path:
             print(f"Hierarchical initialization:")
             print(f"  Base model (core): {args.base_model_path}")
@@ -503,6 +517,12 @@ def main():
     model.train()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
+    
+    # Enable gradient checkpointing for memory-efficient training
+    if getattr(args, 'gradient_checkpointing', False):
+        model.gradient_checkpointing_enable()
+        print("Gradient checkpointing enabled")
+    
     print(f"Model on device: {device}")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -510,6 +530,8 @@ def main():
     preview = ResidualPreview(args.hidden_size, args.residual_preview_hidden).to(device) if args.enable_token_delta else None
 
     # Data loading - pack at training time (like ModernBERT/rexgemma)
+    use_packed_loader = False  # Flag to control training loop behavior
+    
     if args.pretokenized_path:
         # Load pretokenized data and pack at training time
         print(f"Loading pretokenized data from: {args.pretokenized_path}")
@@ -542,6 +564,7 @@ def main():
         )
         train_iter = None
         eval_loader = None
+        use_packed_loader = True  # Use DataLoader path in training loop
         
         # Throughput info
         eff_tokens_per_step = args.batch_size * args.pack_seq_len * max(1, args.grad_accum)
@@ -614,8 +637,17 @@ def main():
 
     while step < args.train_steps:
         # Get batch
-        if args.streaming:
-            # Accumulate samples for batch
+        if use_packed_loader or not args.streaming:
+            # Use DataLoader (packed data or non-streaming)
+            if train_iter is None:
+                train_iter = iter(train_loader)
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                batch = next(train_iter)
+        else:
+            # Streaming mode - accumulate samples for batch
             while len(batch_buffer) < args.batch_size:
                 try:
                     sample = next(train_iter)
@@ -628,14 +660,6 @@ def main():
             batch_samples = batch_buffer[:args.batch_size]
             batch_buffer = batch_buffer[args.batch_size:]
             batch = collator(batch_samples)
-        else:
-            if train_iter is None:
-                train_iter = iter(train_loader)
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                batch = next(train_iter)
 
         step += 1
         

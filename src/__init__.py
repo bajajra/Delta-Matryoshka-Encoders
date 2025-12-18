@@ -14,7 +14,7 @@ from .losses import (
 from .routing import ResidualPreview, token_topk_mask
 from .droppath import DropPath, SurvivalSchedule, PrefixDepthDropout
 from .scheduler import PhaseScheduler, PhaseSchedulerConfig, BudgetSampler
-from .weight_init import load_rexbert_to_delta
+from .weight_init import load_rexbert_to_delta, init_from_scratch, init_hierarchical_delta
 from .eval_metrics import MetricsTracker, run_full_evaluation, compute_delta_pack_size
 from .hf_export import (
     DeltaMatryoshkaConfig, DeltaMatryoshkaModel, DeltaMatryoshkaForMaskedLM,
@@ -60,6 +60,8 @@ __all__ = [
     
     # Weight init
     "load_rexbert_to_delta",
+    "init_from_scratch",
+    "init_hierarchical_delta",
     
     # Evaluation
     "MetricsTracker",

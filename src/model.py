@@ -5,8 +5,12 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .droppath import DropPath
+
+# Check for Flash Attention / SDPA support (PyTorch 2.0+)
+HAS_FLASH_ATTN = hasattr(F, 'scaled_dot_product_attention')
 
 # ---------------- Budget spec ----------------
 
@@ -268,8 +272,22 @@ class DeltaSelfAttention(nn.Module):
             return out, delta_out
         return out
 
-    def _attend(self, q, k, v, attn_mask=None):
+    def _attend(self, q, k, v, attn_mask=None, use_flash=True):
         # q,k,v: (B, h, T, d)
+        # Use Flash Attention / SDPA when available (PyTorch 2.0+)
+        if use_flash and HAS_FLASH_ATTN and self.training:
+            # scaled_dot_product_attention expects: (B, h, T, d)
+            # attn_mask for SDPA should be boolean or additive
+            dropout_p = self.attn_drop.p if self.training else 0.0
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=False,  # Bidirectional encoder
+            )
+            return out
+        
+        # Fallback to manual attention
         scale = 1.0 / math.sqrt(self.head_dim)
         attn = (q * scale) @ k.transpose(-2, -1)  # (B, h, T, T)
         if attn_mask is not None:
@@ -400,6 +418,17 @@ class DeltaEncoder(nn.Module):
         # LM head
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         self.tie_weights()
+        
+        # Gradient checkpointing (disabled by default)
+        self.gradient_checkpointing = False
+
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing for memory-efficient training."""
+        self.gradient_checkpointing = True
+    
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing."""
+        self.gradient_checkpointing = False
 
     def tie_weights(self):
         self.lm_head.weight = self.embeddings.word_embeddings.weight
@@ -454,13 +483,30 @@ class DeltaEncoder(nn.Module):
         for i, layer in enumerate(self.layers):
             if i >= depth_keep:
                 break  # prefix depth dropout
-            x = layer(x, budget, attention_mask=attn_bias,
-                      token_delta_mask=token_delta_mask,
-                      return_delta=return_delta, delta_only=delta_only,
-                      use_dds=use_dds)
-            if return_delta:
-                x, delta_h = x  # layer returns (x, delta_hidden)
-                delta_hiddens.append(delta_h)
+            
+            # Use gradient checkpointing if enabled (saves memory)
+            if self.gradient_checkpointing and self.training and not return_delta:
+                # Checkpointing doesn't work well with multiple returns, skip for return_delta
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(inputs[0], inputs[1], attention_mask=inputs[2],
+                                    token_delta_mask=inputs[3], return_delta=False,
+                                    delta_only=inputs[4], use_dds=inputs[5])
+                    return custom_forward
+                
+                x = checkpoint(
+                    create_custom_forward(layer),
+                    x, budget, attn_bias, token_delta_mask, delta_only, use_dds,
+                    use_reentrant=False
+                )
+            else:
+                x = layer(x, budget, attention_mask=attn_bias,
+                          token_delta_mask=token_delta_mask,
+                          return_delta=return_delta, delta_only=delta_only,
+                          use_dds=use_dds)
+                if return_delta:
+                    x, delta_h = x  # layer returns (x, delta_hidden)
+                    delta_hiddens.append(delta_h)
             
             # Collect tap hiddens for CSCF
             if tap_layers is not None and i in tap_layers:
