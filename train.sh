@@ -1,10 +1,13 @@
 python -m src.train_mlm \
-  --pretokenized_path ./data/ecom-tokenized \
+  --train_from_scratch \
+  --gradient_checkpointing \
+  --pretokenized_path ./data/ecom_tokenized_1024 \
   --pack_seq_len 2048 \
+  --max_position_embeddings 2048 \
   --pack_workers 64 \
   --tokenizer thebajajra/RexBERT-base \
   --output_dir ./ckpts/delta_matryoshka \
-  --batch_size 64 \
+  --batch_size 8 \
   --grad_accum 4 \
   --lr 2e-4 \
   --weight_decay 0.01 \
